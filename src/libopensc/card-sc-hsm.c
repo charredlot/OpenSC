@@ -476,6 +476,58 @@ static int sc_hsm_soc_biomatch(sc_card_t *card, struct sc_pin_cmd_data *data,
 	LOG_FUNC_RETURN(card->ctx, SC_ERROR_PIN_CODE_INCORRECT);
 }
 
+/* sets priv->EF_C_DevAut if it hasn't been set yet */
+static int sc_hsm_ensure_ef_c_devaut(sc_card_t *card)
+{
+	sc_hsm_private_data_t *priv;
+	int r = SC_ERROR_INTERNAL;
+	sc_path_t path;
+	u8 all_certs[1024];
+	size_t all_certs_len;
+	u8 *cert;
+
+	priv = (sc_hsm_private_data_t *) card->drv_data;
+	if (priv->EF_C_DevAut != NULL) {
+		return 0;
+	}
+
+	/* get issuer and device certificate from the card */
+	r = sc_path_set(&path, SC_PATH_TYPE_FILE_ID, (u8 *) "\x2F\x02", 2, 0, 0);
+	if (r < 0) {
+		goto err;
+	}
+	r = sc_select_file(card, &path, NULL);
+	if (r < 0) {
+		goto err;
+	}
+
+	all_certs_len = sizeof(all_certs);
+	r = sc_read_binary(card, 0, all_certs, all_certs_len, 0);
+	if (r < 0) {
+		goto err;
+	} else if (r == 0) {
+		r = SC_ERROR_FILE_NOT_FOUND;
+		goto err;
+	}
+
+	assert((size_t)r <= all_certs_len);
+	all_certs_len = r;
+
+	cert = malloc(all_certs_len);
+	if (cert == NULL) {
+		r = SC_ERROR_OUT_OF_MEMORY;
+		goto err;
+	}
+
+	memcpy(cert, all_certs, all_certs_len);
+	priv->EF_C_DevAut = (u8 *)cert;
+	priv->EF_C_DevAut_len = all_certs_len;
+
+	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+
+err:
+	LOG_FUNC_RETURN(card->ctx, r);
+}
 
 
 #ifdef ENABLE_SM
@@ -490,11 +542,9 @@ static int sc_hsm_soc_biomatch(sc_card_t *card, struct sc_pin_cmd_data *data,
 static int sc_hsm_perform_chip_authentication(sc_card_t *card)
 {
 	int r, protocol;
-	sc_path_t path;
-	u8 all_certs[1024];
 	EAC_CTX *ctx = NULL;
-	size_t all_certs_len = sizeof all_certs, left, device_cert_len, issuer_cert_len;
-	const unsigned char *cert = all_certs, *device_cert, *issuer_cert;
+	size_t all_certs_len, left, device_cert_len, issuer_cert_len;
+	const unsigned char *cert, *device_cert, *issuer_cert;
 	BUF_MEM *comp_pub_key = NULL;
 	sc_cvc_t cvc_device, cvc_issuer;
 	/* this is only needed to call sc_pkcs15emu_sc_hsm_decode_cvc */
@@ -507,38 +557,13 @@ static int sc_hsm_perform_chip_authentication(sc_card_t *card)
 	memset(&cvc_device, 0, sizeof(cvc_device));
 	memset(&cvc_issuer, 0, sizeof(cvc_issuer));
 
-
-	if (priv->EF_C_DevAut && priv->EF_C_DevAut_len) {
-		all_certs_len = priv->EF_C_DevAut_len;
-		cert = priv->EF_C_DevAut;
-	} else {
-		/* get issuer and device certificate from the card */
-		r = sc_path_set(&path, SC_PATH_TYPE_FILE_ID, (u8 *) "\x2F\x02", 2, 0, 0);
-		if (r < 0)
-			goto err;
-		r = sc_select_file(card, &path, NULL);
-		if (r < 0)
-			goto err;
-		r = sc_read_binary(card, 0, all_certs, all_certs_len, 0);
-		if (r < 0)
-			goto err;
-		if (r == 0) {
-			r = SC_ERROR_FILE_NOT_FOUND;
-			goto err;
-		}
-
-		all_certs_len = r;
-
-		/* save EF_C_DevAut for further use */
-		cert = realloc(priv->EF_C_DevAut, all_certs_len);
-		if (cert) {
-			memcpy((unsigned char *) cert, all_certs, all_certs_len);
-			priv->EF_C_DevAut = (unsigned char *) cert;
-			priv->EF_C_DevAut_len = all_certs_len;
-		}
-
-		cert = all_certs;
+	r = sc_hsm_ensure_ef_c_devaut(card);
+	if (r < 0) {
+		goto err;
 	}
+
+	all_certs_len = priv->EF_C_DevAut_len;
+	cert = priv->EF_C_DevAut;
 	left = all_certs_len;
 
 	device_cert = cert;

@@ -1248,20 +1248,23 @@ static int sc_hsm_initialize(sc_card_t *card, sc_cardctl_sc_hsm_init_param_t *pa
 
 	if (params->user_pin_len > 0xFF) {
 		return SC_ERROR_INVALID_ARGUMENTS;
+	} else if (params->user_pin_len > 0) {
+		*p++ = 0x81;	// User PIN
+		*p++ = (u8) params->user_pin_len;
+		memcpy(p, params->user_pin, params->user_pin_len);
+		p += params->user_pin_len;
 	}
-	*p++ = 0x81;	// User PIN
-	*p++ = (u8) params->user_pin_len;
-	memcpy(p, params->user_pin, params->user_pin_len);
-	p += params->user_pin_len;
 
 	*p++ = 0x82;	// Initialization code
 	*p++ = 0x08;
 	memcpy(p, params->init_code, 8);
 	p += 8;
 
-	*p++ = 0x91;	// User PIN retry counter
-	*p++ = 0x01;
-	*p++ = params->user_pin_retry_counter;
+	if (params->user_pin_len > 0) {
+		*p++ = 0x91;	// User PIN retry counter
+		*p++ = 0x01;
+		*p++ = params->user_pin_retry_counter;
+	}
 
 	if (params->dkek_shares >= 0) {
 		*p++ = 0x92;	// Number of DKEK shares

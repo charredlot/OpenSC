@@ -622,7 +622,9 @@ static int initialize(sc_card_t *card, const char *so_pin, const char *user_pin,
 
 	param.user_pin_len = strlen(_user_pin);
 
-	if (param.user_pin_len < 6) {
+	if ((param.user_pin_len == 0) && (num_of_pub_keys > 0)) {
+		printf("Initializing with public key authentication only\n");
+	} else if (param.user_pin_len < 6) {
 		fprintf(stderr, "PIN must be at least 6 characters long\n");
 		return -1;
 	}

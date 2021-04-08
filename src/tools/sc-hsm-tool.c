@@ -2171,6 +2171,7 @@ fail:
 end:
 	sc_disconnect_card(card);
 	sc_release_context(ctx);
+	sc_file_free(file);
 
 	ERR_print_errors_fp(stderr);
 	return err;

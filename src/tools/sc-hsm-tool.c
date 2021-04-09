@@ -1813,6 +1813,14 @@ err:
 	return r;
 }
 
+static void print_pka_status(const sc_cardctl_sc_hsm_pka_status_t *status)
+{
+	printf("Number of public keys:     %d\n", status->num_total);
+	printf("Missing public keys:       %d\n", status->num_missing);
+	printf("Required pubkeys for auth: %d\n", status->num_required);
+	printf("Authenticated public keys: %d\n", status->num_authenticated);
+}
+
 static int register_public_key(sc_context_t *ctx, sc_card_t *card, const char *inf)
 {
 	FILE *in = NULL;
@@ -1864,10 +1872,7 @@ static int register_public_key(sc_context_t *ctx, sc_card_t *card, const char *i
 		goto err;
 	}
 
-	printf("Number of public keys:     %d\n", pka_register.new_status.num_total);
-	printf("Missing public keys:       %d\n", pka_register.new_status.num_missing);
-	printf("Required pubkeys for auth: %d\n", pka_register.new_status.num_required); 
-	printf("Authenticated public keys: %d\n", pka_register.new_status.num_authenticated);
+	print_pka_status(&pka_register.new_status);
 
 	r = 0;
 
@@ -1884,8 +1889,9 @@ err:
 
 static int public_key_auth_status(sc_context_t *ctx, sc_card_t *card)
 {
+	sc_cardctl_sc_hsm_pka_status_t status;
 	int r;
-	r = sc_card_ctl(card, SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS, NULL);
+	r = sc_card_ctl(card, SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS, &status);
 	if (r == SC_ERROR_INS_NOT_SUPPORTED) { /* Not supported or not initialized for public key registration */
 		fprintf(stderr, "Card not initialized for public key registration\n");
 		return -1;
@@ -1894,6 +1900,8 @@ static int public_key_auth_status(sc_context_t *ctx, sc_card_t *card)
 		fprintf(stderr, "sc_card_ctl(*, SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS, *) failed with %s\n", sc_strerror(r));
 		return -1;
 	}
+
+	print_pka_status(&status);
 	return 0;
 }
 

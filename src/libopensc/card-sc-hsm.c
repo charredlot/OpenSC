@@ -530,6 +530,46 @@ err:
 }
 
 
+static int sc_hsm_ensure_device_chr(sc_card_t *card)
+{
+	int r;
+	sc_hsm_private_data_t *priv;
+	const u8 *cert;
+	size_t cert_len;
+	sc_pkcs15_card_t p15card;
+	sc_cvc_t cvc_device;
+
+	memset(&cvc_device, 0, sizeof(cvc_device));
+
+	priv = (sc_hsm_private_data_t *) card->drv_data;
+    if (priv->device_chr_len > 0) {
+        /* already set */
+        return 0;
+    }
+
+	r = sc_hsm_ensure_ef_c_devaut(card);
+	LOG_TEST_GOTO_ERR(card->ctx, r, "sc_hsm_ensure_ef_c_devaut failed");
+
+	/* the first certificate from EF_C_DevAut identifies the device */
+	cert = priv->EF_C_DevAut;
+	cert_len = priv->EF_C_DevAut_len;
+
+	memset(&p15card, 0, sizeof(p15card));
+	p15card.card = card;
+	r = sc_pkcs15emu_sc_hsm_decode_cvc(&p15card, &cert, &cert_len, &cvc_device);
+	LOG_TEST_GOTO_ERR(card->ctx, r, "sc_pkcs15emu_sc_hsm_decode_cvc failed");
+
+	assert(cvc_device.chrLen <= sizeof(priv->device_chr));
+	memcpy(priv->device_chr, cvc_device.chr, cvc_device.chrLen);
+    priv->device_chr_len = cvc_device.chrLen;
+
+	r = SC_SUCCESS;
+
+err:
+	sc_pkcs15emu_sc_hsm_free_cvc(&cvc_device);
+	LOG_FUNC_RETURN(card->ctx, r);
+}
+
 #ifdef ENABLE_SM
 #ifdef ENABLE_OPENPACE
 #include "sm/sm-eac.h"
@@ -1629,7 +1669,153 @@ static int sc_hsm_public_key_auth_status(sc_card_t *card,
 	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 }
 
+static int sc_hsm_pka_get_key_chr(sc_card_t *card,
+		sc_cardctl_sc_hsm_pka_get_key_chr_t *key_info)
+{
+	int r;
+	sc_apdu_t apdu;
+	sc_context_t *ctx;
 
+	ctx = card->ctx;
+
+	sc_format_apdu_ex(&apdu, 0x80, 0x54, 0x02, key_info->key_index,
+			NULL, 0, key_info->chr, sizeof(key_info->chr));
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_GOTO_ERR(ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_GOTO_ERR(ctx, r, "Check SW error");
+
+	return 0;
+
+err:
+    return -1;
+}
+
+static int sc_hsm_pka_set_public_key(
+	sc_card_t *card,
+	const sc_cardctl_sc_hsm_pka_challenge_t *challenge)
+{
+	/* we know the CHR only needs a 1-byte ASN.1 length plus the 1-byte tag */
+	u8 public_key_ref[SC_HSM_CHR_LEN + 2];
+	u8 *end;
+	sc_apdu_t apdu;
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+	assert(challenge->challenge_len <= SC_HSM_CHR_LEN);
+
+	r = sc_asn1_put_tag(
+			SC_ASN1_TAG_CONTEXT | SC_ASN1_TAG_BIT_STRING,
+			challenge->public_key_chr, sizeof(challenge->public_key_chr),
+			public_key_ref, sizeof(public_key_ref),
+			&end);
+	LOG_TEST_RET(card->ctx, r, "Public Key CHR ASN.1 encode error");
+
+	/* "MANAGE SECURITY ENVIRONMENT" to set the public key to be authed */
+	sc_format_apdu_ex(&apdu, 0x00, 0x22, 0x81, 0xA4,
+					public_key_ref, end - public_key_ref,
+					NULL, 0);
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_RET(card->ctx, r, "Check SW error");
+
+	r = SC_SUCCESS;
+	LOG_FUNC_RETURN(card->ctx, r);
+}
+
+static int sc_hsm_pka_challenge(
+	sc_card_t *card,
+	sc_cardctl_sc_hsm_pka_challenge_t *challenge)
+{
+	int r = SC_ERROR_UNKNOWN;
+	sc_hsm_private_data_t *priv;
+
+	LOG_FUNC_CALLED(card->ctx);
+
+	/*
+	 * public key auth challenge is defined in the doc as the CHR from DevAut
+	 * concatenated with 8 bytes from the "GET CHALLENGE" command
+	 */
+	r = sc_hsm_ensure_device_chr(card);
+	if (r < 0) {
+		goto done;
+	}
+
+	/* tells the HSM which public key will be authenticated */
+	r = sc_hsm_pka_set_public_key(card, challenge);
+	if (r < 0) {
+		goto done;
+	}
+
+	memset(challenge, 0, sizeof(*challenge));
+
+	priv = (sc_hsm_private_data_t *) card->drv_data;
+	challenge->challenge_len = priv->device_chr_len;
+	assert(challenge->challenge_len <= SC_HSM_CHR_LEN);
+	memcpy(challenge->challenge, priv->device_chr, challenge->challenge_len);
+
+	size_t i;
+	printf("CHR: ");
+	for (i = 0; i < sizeof(priv->device_chr); i++) {
+		char c;
+
+		c = priv->device_chr[i];
+		if (isprint(c)) {
+			printf("%c", c);
+		} else {
+			printf("\\x%02x", c);
+		}
+	}
+	printf("\n");
+
+	/* get the random challenge */
+	r = sc_hsm_get_challenge(card,
+							 &challenge->challenge[challenge->challenge_len],
+							 SC_HSM_PKA_CHALLENGE_RANDOM_LEN);
+	if (r < 0) {
+		goto done;
+	}
+	challenge->challenge_len += SC_HSM_PKA_CHALLENGE_RANDOM_LEN;
+
+	for (i = 0; i < challenge->challenge_len; i++) {
+		printf("%02x", challenge->challenge[i]);
+	}
+	printf("\n");
+
+	r = SC_SUCCESS;
+    /* fall-through */
+
+done:
+	LOG_FUNC_RETURN(card->ctx, r);
+}
+
+static int sc_hsm_pka_authenticate(
+	sc_card_t *card,
+	sc_cardctl_sc_hsm_pka_authenticate_t *auth)
+{
+	sc_apdu_t apdu;
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+
+	/* "EXTERNAL AUTHENTICATE" for public key authentication */
+	sc_format_apdu_ex(&apdu, 0x00, 0x82, 0x00, 0x00,
+					auth->signature, sizeof(auth->signature),
+					NULL, 0);
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_RET(card->ctx, r, "Check SW error");
+
+	r = SC_SUCCESS;
+	LOG_FUNC_RETURN(card->ctx, r);
+}
 
 static int sc_hsm_init_token(sc_card_t *card, sc_cardctl_pkcs11_init_token_t *params)
 {
@@ -1799,6 +1985,12 @@ static int sc_hsm_card_ctl(sc_card_t *card, unsigned long cmd, void *ptr)
 		return sc_hsm_register_public_key(card, ptr);
 	case SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS:
 		return sc_hsm_public_key_auth_status(card, ptr);
+	case SC_CARDCTL_SC_HSM_PKA_GET_KEY_CHR:
+		return sc_hsm_pka_get_key_chr(card, ptr);
+	case SC_CARDCTL_SC_HSM_PKA_CHALLENGE:
+		return sc_hsm_pka_challenge(card, ptr);
+	case SC_CARDCTL_SC_HSM_PKA_AUTHENTICATE:
+		return sc_hsm_pka_authenticate(card, ptr);
 	}
 	return SC_ERROR_NOT_SUPPORTED;
 }

@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #ifndef _WIN32
 #include <sys/types.h>
@@ -57,6 +58,7 @@
 #endif
 
 #include "pkcs11/pkcs11.h"
+#include "pkcs11/sc-pkcs11.h"
 #include "pkcs11/pkcs11-opensc.h"
 #include "libopensc/asn1.h"
 #include "libopensc/log.h"
@@ -182,7 +184,8 @@ enum {
 	OPT_ALLOWED_MECHANISMS,
 	OPT_OBJECT_INDEX,
 	OPT_ALLOW_SW,
-	OPT_LIST_INTERFACES
+	OPT_LIST_INTERFACES,
+	OPT_PUBLIC_KEY_AUTH_CHALLENGE,
 };
 
 static const struct option options[] = {
@@ -263,6 +266,7 @@ static const struct option options[] = {
 #endif
 	{ "generate-random",	1, NULL,		OPT_GENERATE_RANDOM },
 	{ "allow-sw",		0, NULL,		OPT_ALLOW_SW },
+	{ "public-key-auth-challenge",	0, NULL,	OPT_PUBLIC_KEY_AUTH_CHALLENGE },
 
 	{ NULL, 0, NULL, 0 }
 };
@@ -345,6 +349,7 @@ static const char *option_help[] = {
 #endif
 	"Generate given amount of random data",
 	"Allow using software mechanisms (without CKF_HW)",
+	"Login using public-key authentication (SmartCard HSM only)",
 };
 
 static const char *	app_name = "pkcs11-tool"; /* for utils.c */
@@ -475,6 +480,7 @@ static void		list_mechs(CK_SLOT_ID);
 static void		list_objects(CK_SESSION_HANDLE, CK_OBJECT_CLASS);
 static void		list_interfaces(void);
 static int		login(CK_SESSION_HANDLE, int);
+static int		pka_challenge_login(CK_SESSION_HANDLE, int);
 static void		init_token(CK_SLOT_ID);
 static void		init_pin(CK_SLOT_ID, CK_SESSION_HANDLE);
 static int		change_pin(CK_SLOT_ID, CK_SESSION_HANDLE);
@@ -667,6 +673,7 @@ int main(int argc, char * argv[])
 	int do_unlock_pin = 0;
 	int action_count = 0;
 	int do_generate_random = 0;
+	int do_pka_challenge = 0;
 	char *s = NULL;
 	CK_RV rv;
 
@@ -1036,6 +1043,12 @@ int main(int argc, char * argv[])
 			do_list_interfaces = 1;
 			action_count++;
 			break;
+		case OPT_PUBLIC_KEY_AUTH_CHALLENGE:
+			need_session |= NEED_SESSION_RW;
+			opt_login = 1;
+			opt_login_type = CKU_USER;
+            do_pka_challenge = 1;
+			break;
 		default:
 			util_print_usage_and_die(app_name, options, option_help, NULL);
 		}
@@ -1196,9 +1209,14 @@ int main(int argc, char * argv[])
 		if (opt_login_type == -1)
 			opt_login_type = do_init_pin ? CKU_SO : CKU_USER;
 
-		r = login(session, opt_login_type);
-		if (r != 0)
-			return r;
+		if (do_pka_challenge) {
+			r = pka_challenge_login(session, opt_login_type);
+		} else {
+			r = login(session, opt_login_type);
+		}
+		if (r != 0) {
+			goto end;
+		}
 	}
 
 	if (do_change_pin)
@@ -1681,6 +1699,445 @@ static int login(CK_SESSION_HANDLE session, int login_type)
 		free(pin);
 
 	return 0;
+}
+
+static int sprintf_iec8859_1_to_utf8(char *dst, size_t dst_len,
+        const u8 *src, size_t src_len)
+{
+	size_t i;
+	size_t dst_i;
+
+	/* worst case need 2x the space + null terminator */
+	if ((src_len * 2) + 1 > dst_len) {
+		return -1;
+	}
+
+	/*
+	 * for historical reasons, ISO/IEC 8859-1 can be programmatically converted
+	 * to UTF-8 since it matches U+0000 to U+00FF
+	 * this can still print badly depending on the output environment
+	 */
+	for (i = 0, dst_i = 0; i < src_len; i++) {
+		if ((0x80 & src[i]) == 0) {
+			dst[dst_i++] = (char)src[i];
+		} else {
+			/* UTF-8 2-byte sequence */
+			dst[dst_i++] = 0xc0 | (src[i] >> 6);
+			dst[dst_i++] = 0x80 | (src[i] & 0x3f);
+		}
+	}
+	dst[dst_i++] = '\0';
+
+	return 0;
+}
+
+static int pka_login_and_get_private_key(CK_SLOT_ID slot_id,
+		const CK_BYTE *object_id, size_t object_id_len,
+		CK_SESSION_HANDLE *session,
+		CK_OBJECT_HANDLE *private_key)
+{
+	CK_RV rv;
+	char *pin = NULL;
+	size_t pin_len = 0;
+	int r;
+
+	rv = p11->C_OpenSession(slot_id, CKF_SERIAL_SESSION,
+		NULL, NULL, session);
+	if (rv != CKR_OK) {
+		p11_fatal("C_OpenSession", rv);
+	}
+
+	printf("Enter User PIN: ");
+
+	pin_len = 0;
+	r = util_getpass(&pin, &pin_len, stdin);
+	if (r < 0) {
+		fprintf(stderr, "Failed to get User PIN");
+		goto err;
+	}
+
+	rv = p11->C_Login(*session, CKU_USER, (CK_UTF8CHAR *)pin, strlen(pin));
+	if (rv != CKR_OK) {
+		fprintf(stderr, "Failed to login: %s\n", CKR2Str(rv));
+		r = -1;
+		goto err;
+	}
+
+	if (find_object(*session, CKO_PRIVATE_KEY, private_key,
+				object_id, object_id_len, 0) == 0) {
+		fprintf(stderr, "Object ID not found\n");
+		r = -1;
+		goto err;
+	}
+
+    /* keep session open to use for signing later */
+	r = 0;
+	goto cleanup;
+
+cleanup:
+	if (pin != NULL) {
+		sc_mem_clear(pin, pin_len);
+		free(pin);
+		pin = NULL;
+	}
+	return r;
+
+err:
+	if (*session != CK_INVALID_HANDLE) {
+		rv = p11->C_CloseSession(*session);
+		if (rv != CKR_OK) {
+			p11_fatal("C_CloseSession", rv);
+		}
+		*session = CK_INVALID_HANDLE;
+	}
+	goto cleanup;
+}
+
+/*
+ * User inputs the signing HSM (by slot) and private key object (by id) that
+ * they will use to authenticate against the PKA HSM
+ *
+ * @param signing_session: out param only
+ * @param signing_private_key: out param only
+ */
+static int pka_input_signing_hsm_and_key(CK_SESSION_HANDLE *signing_session,
+        CK_OBJECT_HANDLE *signing_private_key)
+{
+	CK_SLOT_ID slot_id;
+	CK_ULONG n;
+	int r;
+	char input[16];
+	CK_BYTE object_id[100];
+	size_t object_id_len;
+	CK_RV rv;
+
+	*signing_session = CK_INVALID_HANDLE;
+	*signing_private_key = CK_INVALID_HANDLE;
+
+	/* refresh p11_slots */
+	list_slots(0, 1, 0);
+	printf("Available Slots:\n");
+	for (n = 0; n < p11_num_slots; n++) {
+		CK_SLOT_INFO info;
+
+		slot_id = p11_slots[n];
+		rv = p11->C_GetSlotInfo(slot_id, &info);
+		if (rv != CKR_OK) {
+			fprintf(stderr, "(GetSlotInfo failed, %s)\n", CKR2Str(rv));
+			goto err;
+		}
+
+		printf("  Slot ID 0x%lx: %s\n",
+			   slot_id,
+			   p11_utf8_to_local(info.slotDescription,
+					sizeof(info.slotDescription)));
+    }
+
+	printf("Enter slot ID of HSM to authenticate: ");
+	if (fgets(input, sizeof(input), stdin) == NULL) {
+	    fprintf(stderr, "fgets failed\n");
+		r = -1;
+		goto err;
+	}
+
+	errno = 0;
+	slot_id = (CK_SLOT_ID) strtoul(input, NULL, 0);
+	if (errno != 0) {
+		perror("Bad slot ID");
+		r = -1;
+		goto err;
+	}
+
+	printf("Enter object ID of key to authenticate: ");
+	if (fgets(input, sizeof(input), stdin) == NULL) {
+	    fprintf(stderr, "fgets failed\n");
+		r = -1;
+		goto err;
+	}
+	input[strcspn(input, "\r\n ")] = '\0';
+
+	object_id_len = sizeof(object_id);
+	if (!hex_to_bin(input, object_id, &object_id_len)) {
+		fprintf(stderr, "Bad object ID: '%s'\n", input);
+		r = -1;
+		goto err;
+	}
+
+	printf("Logging in to slot 0x%lx to access private key ID '%s'\n",
+			slot_id, input);
+
+	r = pka_login_and_get_private_key(slot_id, object_id, object_id_len,
+			signing_session, signing_private_key);
+	if (r < 0) {
+		fprintf(stderr, "Failed to login to slot ID 0x%lx\n", slot_id);
+		goto err;
+	}
+
+	return 0;
+
+err:
+	if (*signing_session != CK_INVALID_HANDLE) {
+		rv = p11->C_CloseSession(*signing_session);
+		if (rv != CKR_OK) {
+			p11_fatal("C_CloseSession", rv);
+		}
+		*signing_session = CK_INVALID_HANDLE;
+	}
+	return r;
+}
+
+/*
+ * - Get a PKA challenge from card for the given public_key_chr (which should
+ *   be registed for public key authentication on card)
+ * - Signs the resulting challenge with the signing_private_key (which should
+ *   match the public_key_chr).
+ * - Sends the signature to card to be verified
+ *
+ */
+static int pka_sign_challenge_and_verify(sc_card_t *pka_card,
+        const u8 *public_key_chr, size_t public_key_chr_len,
+        CK_SESSION_HANDLE signing_session,
+        CK_OBJECT_HANDLE signing_private_key)
+{
+	int r;
+	sc_cardctl_sc_hsm_pka_challenge_t challenge;
+	sc_cardctl_sc_hsm_pka_authenticate_t auth;
+	CK_RV rv;
+	/* this is the only signature mechanism allowed for public key auth */
+	CK_MECHANISM mech = { .mechanism = CKM_ECDSA_SHA256 };
+	CK_ULONG len;
+
+	memset(&challenge, 0, sizeof(challenge));
+	memset(&auth, 0, sizeof(auth));
+
+	assert(public_key_chr_len <= sizeof(challenge.public_key_chr));
+	memcpy(challenge.public_key_chr, public_key_chr, public_key_chr_len);
+
+	r = sc_card_ctl(pka_card, SC_CARDCTL_SC_HSM_PKA_CHALLENGE,
+					&challenge);
+	if (r < 0) {
+		fprintf(stderr,
+				"sc_card_ctl(*, SC_CARDCTL_SC_HSM_PKA_CHALLENGE, *)"
+				" failed with %s\n",
+				sc_strerror(r));
+		r = -1;
+		goto done;
+	}
+
+	rv = p11->C_SignInit(signing_session, &mech, signing_private_key);
+	if (rv != CKR_OK) {
+		fprintf(stderr, "PKA C_SignInit failed: %s\n", CKR2Str(rv));
+		r = -1;
+		goto done;
+	}
+
+	rv = p11->C_SignUpdate(signing_session, challenge.challenge,
+			challenge.challenge_len);
+	if (rv != CKR_OK) {
+		fprintf(stderr, "PKA C_SignUpdate failed: %s\n", CKR2Str(rv));
+		r = -1;
+		goto done;
+	}
+
+	len = sizeof(auth.signature);
+	rv = p11->C_SignFinal(signing_session, auth.signature, &len);
+	if (rv != CKR_OK) {
+		fprintf(stderr, "PKA C_SignFinal failed: %s\n", CKR2Str(rv));
+		r = -1;
+		goto done;
+	}
+	assert(len == SC_HSM_PKA_SIGNATURE_LEN);
+
+	r = sc_card_ctl(pka_card, SC_CARDCTL_SC_HSM_PKA_AUTHENTICATE, &auth);
+	if (r < 0) {
+		fprintf(stderr,
+				"sc_card_ctl(*, SC_CARDCTL_SC_HSM_PKA_AUTHENTICATE, *)"
+				" failed with %s\n",
+				sc_strerror(r));
+		r = -1;
+		goto done;
+	}
+
+	return 0;
+
+done:
+	return r;
+}
+
+/*
+ * Let the user choose which registered public key they're trying to
+ * authenticate.
+ */
+static int pka_input_registered_public_key_chr(sc_card_t *card,
+        u8 num_total_pka_keys, u8 *chr, size_t chr_len)
+{
+	int r;
+	sc_cardctl_sc_hsm_pka_get_key_chr_t *keys;
+	u8 i;
+	unsigned long public_key_index;
+	char input[32];
+
+	keys = calloc(num_total_pka_keys, sizeof(keys[0]));
+	if (keys == NULL) {
+		r = SC_ERROR_OUT_OF_MEMORY;
+		goto done;
+	}
+
+	printf("Registered Public Keys:\n");
+	for (i = 0; i < num_total_pka_keys; i++) {
+		char chr_utf8[(sizeof(keys[i]) * 2) + 1];
+
+		keys[i].key_index = i;
+		r = sc_card_ctl(card, SC_CARDCTL_SC_HSM_PKA_GET_KEY_CHR, &keys[i]);
+		if (r < 0) {
+			fprintf(stderr,
+					"SC_CARDCTL_SC_HSM_PKA_GET_KEY_CHR failed with %s\n",
+					sc_strerror(r));
+			goto done;
+		}
+
+		/* certificate holder reference has ASCII and ISO/IEC 8859-1 */
+		sprintf_iec8859_1_to_utf8(chr_utf8, sizeof(chr_utf8),
+				keys[i].chr, sizeof(keys[i].chr));
+		printf("  [%u]: %s\n", i, chr_utf8);
+	}
+
+	printf("Enter index of public key to authenticate: ");
+	if (fgets(input, sizeof(input), stdin) == NULL) {
+		r = -1;
+		goto done;
+	}
+
+	errno = 0;
+	public_key_index = strtoul(input, NULL, 0);
+	if (errno != 0) {
+		perror("Bad public key index");
+		r = -1;
+		goto done;
+	} else if (public_key_index >= num_total_pka_keys) {
+		fprintf(stderr, "Index %lu is too big", public_key_index);
+		r = -1;
+		goto done;
+	}
+
+	assert(chr_len >= sizeof(keys[public_key_index].chr));
+	memcpy(chr, keys[public_key_index].chr, sizeof(keys[public_key_index].chr));
+
+	r = 0;
+	/* fall-through */
+
+done:
+	if (keys != NULL) {
+		free(keys);
+		keys = NULL;
+	}
+	return r;
+}
+
+static int pka_challenge_login(
+		CK_SESSION_HANDLE handle,
+        int login_type)
+{
+	int r;
+	sc_card_t *card;
+	struct sc_pkcs11_session *session;
+	CK_SESSION_HANDLE signing_session = CK_INVALID_HANDLE;
+	CK_RV rv;
+
+	session = (struct sc_pkcs11_session *)(uintptr_t)handle;
+	if (!session || !session->slot || !session->slot->p11card ||
+		!session->slot->p11card->card) {
+		fprintf(stderr, "bad session\n");
+		r = -1;
+		goto done;
+	}
+
+	card = session->slot->p11card->card;
+
+	if (!card->driver || !card->driver->name ||
+		strcmp(card->driver->name, "SmartCard-HSM") != 0) {
+		fprintf(stderr,
+				"driver '%s' is not supported, must be 'SmartCard-HSM'\n",
+				card->driver ? card->driver->name : NULL);
+		r = -1;
+		goto done;
+	}
+
+	while (1) {
+		sc_cardctl_sc_hsm_pka_status_t status;
+		CK_OBJECT_HANDLE signing_private_key;
+		u8 public_key_chr[SC_HSM_CHR_LEN];
+
+		r = sc_card_ctl(card, SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS, &status);
+		if (r < 0) {
+			fprintf(stderr,
+					"SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS failed with %s\n",
+					sc_strerror(r));
+			goto done;
+		}
+
+		if (status.num_missing > 0) {
+			fprintf(stderr,
+					"Public key authentication requires %u more public keys to be registered",
+					status.num_missing);
+			r = -1;
+			goto done;
+		}
+
+		printf("%u of %u required public keys authenticated\n",
+				status.num_authenticated,
+				status.num_required);
+
+		if (status.num_authenticated >= status.num_required) {
+			printf("Public key authentication finished, continuing...\n");
+			break;
+		}
+
+		/*
+		 * The signing key needs to be ready to go before getting the challenge
+		 * because we must sign the challenge within the time interval.
+		 */
+		r = pka_input_signing_hsm_and_key(&signing_session,
+			&signing_private_key);
+		if (r < 0) {
+			goto done;
+		}
+
+		r = pka_input_registered_public_key_chr(card, status.num_total,
+				public_key_chr, sizeof(public_key_chr));
+		if (r < 0) {
+			goto done;
+		}
+
+		r = pka_sign_challenge_and_verify(card,
+				public_key_chr, sizeof(public_key_chr),
+				signing_session, signing_private_key);
+		if (r < 0) {
+			goto done;
+		}
+
+		if (signing_session != CK_INVALID_HANDLE) {
+			rv = p11->C_CloseSession(signing_session);
+			if (rv != CKR_OK) {
+				p11_fatal("C_CloseSession", rv);
+			}
+			signing_session = CK_INVALID_HANDLE;
+		}
+	}
+
+	/* FIXME: this is a hack - if we've succeeded, set the slot to logged in */
+	session->slot->login_user = CKU_USER;
+	r = 0;
+
+done:
+	if (signing_session != CK_INVALID_HANDLE) {
+		rv = p11->C_CloseSession(signing_session);
+		if (rv != CKR_OK) {
+			p11_fatal("C_CloseSession", rv);
+		}
+		signing_session = CK_INVALID_HANDLE;
+	}
+	return r;
 }
 
 static void init_token(CK_SLOT_ID slot)

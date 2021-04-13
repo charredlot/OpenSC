@@ -276,6 +276,9 @@ enum {
 	SC_CARDCTL_SC_HSM_UNWRAP_KEY,
 	SC_CARDCTL_SC_HSM_REGISTER_PUBLIC_KEY,
 	SC_CARDCTL_SC_HSM_PUBLIC_KEY_AUTH_STATUS,
+	SC_CARDCTL_SC_HSM_PKA_GET_KEY_CHR,
+	SC_CARDCTL_SC_HSM_PKA_CHALLENGE,
+	SC_CARDCTL_SC_HSM_PKA_AUTHENTICATE,
 
 	/*
 	 * DNIe specific calls
@@ -1091,6 +1094,49 @@ typedef struct sc_cardctl_sc_hsm_pka_register {
     size_t buflen;
     sc_cardctl_sc_hsm_pka_status_t new_status;
 } sc_cardctl_sc_hsm_pka_register_t;
+
+/* TR-03110 V2.2 the certificate holder reference is exactly 16 bytes */
+#define SC_HSM_CHR_LEN 16
+
+/* the challenge is the CHR concatenated with 8 bytes of random */
+#define SC_HSM_PKA_CHALLENGE_RANDOM_LEN 8
+#define SC_HSM_PKA_CHALLENGE_MAX_LEN (SC_HSM_CHR_LEN + \
+	SC_HSM_PKA_CHALLENGE_RANDOM_LEN)
+
+/*
+ * The hardware always expects an ECDSA-SHA256 signature with the
+ * brainpoolP256r1 curve => 256-bit * 2 = 64 bytes
+ */
+#define SC_HSM_PKA_SIGNATURE_LEN 64
+
+typedef struct sc_cardctl_sc_hsm_pka_get_key_chr {
+	/*
+	 * output param: certificate holder reference
+	 *
+	 * From TR-03110 V2.2 the Holder Mnemonic and Sequence Number are
+	 * ISO/IEC 8859-1 which is not ASCII compatible.
+	 */
+	u8 chr[SC_HSM_CHR_LEN];
+
+	u8 key_index; /* input param: zero-based index */
+} sc_cardctl_sc_hsm_pka_get_key_chr_t;
+
+typedef struct sc_cardctl_sc_hsm_pka_challenge {
+	/*
+	 * input param: the CHR (also called device id in the docs) for the public
+	 * key that will be authenticated
+	 */
+	u8 public_key_chr[SC_HSM_CHR_LEN];
+
+	/* output param: the buffer containing the challenge */
+	u8 challenge[SC_HSM_PKA_CHALLENGE_MAX_LEN];
+    size_t challenge_len;
+} sc_cardctl_sc_hsm_pka_challenge_t;
+
+typedef struct sc_cardctl_sc_hsm_pka_authenticate {
+	u8 signature[SC_HSM_PKA_SIGNATURE_LEN];
+} sc_cardctl_sc_hsm_pka_authenticate_t;
+
 
 /*
  * isoApplet

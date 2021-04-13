@@ -67,6 +67,8 @@ typedef struct sc_hsm_private_data {
 	u8 sopin[8];
 	u8 *EF_C_DevAut;
 	size_t EF_C_DevAut_len;
+	u8 device_chr[SC_HSM_CHR_LEN];
+	size_t device_chr_len;
 } sc_hsm_private_data_t;
 
 
